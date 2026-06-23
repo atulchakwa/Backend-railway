@@ -15,7 +15,7 @@ import fs from 'fs';
 import path from 'path';
 dotenv.config();
 import axios from 'axios';
-import { RekognitionClient, CompareFacesCommand } from "@aws-sdk/client-rekognition";
+import { RekognitionClient, CompareFacesCommand, DetectLabelsCommand, DetectFacesCommand } from "@aws-sdk/client-rekognition";
 import sharp from 'sharp';
 import * as evidence from './evidence_manager.js';
 import { PDFRenderer } from './pdf_renderer.js';
@@ -781,7 +781,7 @@ app.post('/api/cts/create-emergency-task', verifyToken, async (req, res) => {
 });
 app.get('/api/passenger/tasks', verifyToken, async (req, res) => {
   try {
-    const { trainNo, coachNo } = req.query;
+    const { trainNo } = req.query;
 
     let query = db.collection('passenger_tasks');
 
@@ -789,15 +789,17 @@ app.get('/api/passenger/tasks', verifyToken, async (req, res) => {
       query = query.where('trainNo', '==', trainNo);
     }
 
-    if (coachNo) {
-      query = query.where('coachNo', '==', coachNo);
-    }
-
-    const snapshot = await query.orderBy('createdAt', 'desc').get();
+    const snapshot = await query.get();
 
     const tasks = [];
     snapshot.forEach(doc => {
       tasks.push({ uid: doc.id, ...doc.data() });
+    });
+
+    tasks.sort((a, b) => {
+      const dateA = a.createdAt ? new Date(a.createdAt) : new Date(0);
+      const dateB = b.createdAt ? new Date(b.createdAt) : new Date(0);
+      return dateB - dateA;
     });
 
     return res.status(200).json({
@@ -807,11 +809,43 @@ app.get('/api/passenger/tasks', verifyToken, async (req, res) => {
     });
 
   } catch (error) {
-    console.error('(Get Passenger Tasks) Failed:', error);
-    return res.status(500).json({
-      error: 'Internal Server Error',
-      details: error.message
+    console.error('(Passenger Tasks Retrieval) Failed:', error);
+    return res.status(500).json({ error: 'Internal Server Error', details: error.message });
+  }
+});
+
+// API: Get Active Coaches for a Train (For Passenger App Dropdown)
+app.get('/api/passenger/train/:trainNo/coaches', async (req, res) => {
+  try {
+    const { trainNo } = req.params;
+
+    // Find an active run instance for this train
+    const runsSnap = await db.collection('RunInstance')
+      .where('trainNo', '==', trainNo)
+      .where('status', 'in', ['ACTIVE', 'RUNNING', 'ALLOCATED', 'READY'])
+      .get();
+
+    if (runsSnap.empty) {
+      return res.status(200).json({ success: true, coaches: [] });
+    }
+
+    // Combine coaches from all active instances (usually there's only 1 or 2 overlapping)
+    const coachSet = new Set();
+    runsSnap.forEach(doc => {
+      const runData = doc.data();
+      if (runData.coaches && Array.isArray(runData.coaches)) {
+        runData.coaches.forEach(c => {
+          if (c.coachPosition) coachSet.add(c.coachPosition);
+          else if (c.coachNumber) coachSet.add(c.coachNumber);
+        });
+      }
     });
+
+    const sortedCoaches = Array.from(coachSet).sort();
+    return res.status(200).json({ success: true, coaches: sortedCoaches });
+  } catch (error) {
+    console.error('(Passenger Coaches Fetch) Failed:', error);
+    return res.status(500).json({ error: 'Internal Server Error', details: error.message });
   }
 });
 
@@ -9122,6 +9156,97 @@ async function compareFaces(image1Url, image2Url) {
   }
 }
 
+async function verifyFaceLiveness(imageUrl, expectedChallenge) {
+  try {
+    if (!imageUrl || imageUrl.includes('undefined')) {
+      return { matched: false, reason: "Invalid image URL." };
+    }
+
+    const getStoragePath = (url) => {
+      try {
+        const decodedUrl = decodeURIComponent(url);
+        const parts = decodedUrl.split('/o/');
+        if (parts.length > 1) {
+          return parts[1].split('?')[0];
+        }
+        return null;
+      } catch (e) {
+        return null;
+      }
+    };
+
+    const path = getStoragePath(imageUrl);
+    if (!path) return { matched: false, reason: "Failed to extract cloud path." };
+
+    const [fileBuffer] = await bucket.file(path).download();
+    if (!fileBuffer || fileBuffer.length === 0) return { matched: false, reason: "Empty image buffer." };
+
+    if (expectedChallenge === 'THUMBS_UP' || expectedChallenge === 'FIST') {
+      const command = new DetectLabelsCommand({
+        Image: { Bytes: fileBuffer },
+        MaxLabels: 20,
+      });
+
+      const data = await rekognition.send(command);
+      const labels = data.Labels || [];
+      
+      let matched = false;
+      const detectedLabels = labels.map(l => l.Name.toLowerCase());
+      console.log(`[Liveness Debug] Detected labels:`, detectedLabels);
+
+      if (expectedChallenge === 'THUMBS_UP') {
+        matched = labels.some(l => {
+          const name = l.Name.toLowerCase();
+          return (name.includes('thumb') || name.includes('hand') || name.includes('finger') || name.includes('gesture')) && l.Confidence > 60;
+        });
+      } else if (expectedChallenge === 'FIST') {
+        matched = labels.some(l => {
+          const name = l.Name.toLowerCase();
+          return (name.includes('fist') || name.includes('hand') || name.includes('clenched')) && l.Confidence > 60;
+        });
+      }
+
+      if (matched) {
+        return { matched: true, reason: `Successfully verified gesture challenge: ${expectedChallenge}` };
+      } else {
+        return { matched: false, reason: `Failed to detect the expected gesture: ${expectedChallenge}` };
+      }
+    } else {
+      const command = new DetectFacesCommand({
+        Image: { Bytes: fileBuffer },
+        Attributes: ['ALL']
+      });
+
+      const data = await rekognition.send(command);
+      if (!data.FaceDetails || data.FaceDetails.length === 0) {
+        return { matched: false, reason: "No face detected in the image." };
+      }
+
+      const face = data.FaceDetails[0];
+      let matched = false;
+
+      if (expectedChallenge === 'SMILE') {
+        matched = face.Smile && face.Smile.Value === true && face.Smile.Confidence > 70;
+      } else if (expectedChallenge === 'EYES_OPEN') {
+        matched = face.EyesOpen && face.EyesOpen.Value === true && face.EyesOpen.Confidence > 70;
+      } else if (expectedChallenge === 'BLINK' || expectedChallenge === 'EYES_CLOSED') {
+        matched = face.EyesOpen && face.EyesOpen.Value === false && face.EyesOpen.Confidence > 70;
+      } else {
+        matched = true;
+      }
+
+      if (matched) {
+        return { matched: true, reason: `Successfully verified face challenge: ${expectedChallenge}` };
+      } else {
+        return { matched: false, reason: `Failed to verify expected face challenge: ${expectedChallenge}` };
+      }
+    }
+  } catch (err) {
+    console.error("AWS Rekognition liveness failure:", err.message);
+    return { matched: false, reason: "Internal system error during liveness verification." };
+  }
+}
+
 // =======================================================
 // == API 4.7.1: Worker Attendance Issue Reporting
 // =======================================================
@@ -9675,6 +9800,57 @@ app.post('/api/compareFace', verifyToken, async (req, res) => {
     });
   } catch (error) {
     res.status(500).send({ error: 'Face comparison failed', details: error.message });
+  }
+});
+
+app.post('/api/verifyLiveness', verifyToken, async (req, res) => {
+  try {
+    const { imageUrl, expectedChallenge } = req.body;
+    if (!imageUrl || !expectedChallenge) {
+      return res.status(400).send({
+        error: "Missing parameters",
+        details: "Both imageUrl and expectedChallenge are required."
+      });
+    }
+    const result = await verifyFaceLiveness(imageUrl, expectedChallenge);
+    res.status(result.matched ? 200 : 400).send(result);
+  } catch (error) {
+    console.error('(Liveness Verification Endpoint) Error:', error);
+    res.status(500).send({ error: 'Liveness verification failed', details: error.message });
+  }
+});
+
+app.post('/api/verifyFaceLiveness', verifyToken, async (req, res) => {
+  try {
+    const { imageUrl, expectedChallenge } = req.body;
+    if (!imageUrl || !expectedChallenge) {
+      return res.status(400).send({
+        error: "Missing parameters",
+        details: "Both imageUrl and expectedChallenge are required."
+      });
+    }
+    const result = await verifyFaceLiveness(imageUrl, expectedChallenge);
+    res.status(result.matched ? 200 : 400).send(result);
+  } catch (error) {
+    console.error('(Face Liveness Verification Endpoint) Error:', error);
+    res.status(500).send({ error: 'Face liveness verification failed', details: error.message });
+  }
+});
+
+app.post('/api/obhs/attendance/verify-liveness', verifyToken, async (req, res) => {
+  try {
+    const { imageUrl, expectedChallenge } = req.body;
+    if (!imageUrl || !expectedChallenge) {
+      return res.status(400).send({
+        error: "Missing parameters",
+        details: "Both imageUrl and expectedChallenge are required."
+      });
+    }
+    const result = await verifyFaceLiveness(imageUrl, expectedChallenge);
+    res.status(result.matched ? 200 : 400).send(result);
+  } catch (error) {
+    console.error('(Attendance Liveness Verification Endpoint) Error:', error);
+    res.status(500).send({ error: 'Liveness verification failed', details: error.message });
   }
 });
 
