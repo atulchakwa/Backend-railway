@@ -23,9 +23,18 @@ import { ExcelGenerator } from './excel_generator.js';
 import { ReportService } from './report_service.js';
 
 const TWO_FACTOR_API_KEY = process.env.TWOF_API_KEY;
-const serviceAccount = process.env.FIREBASE_SERVICE_ACCOUNT
-  ? JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)
-  : await import('./serviceAccountKey.json', { with: { type: 'json' } }).then(m => m.default);
+let serviceAccount;
+if (process.env.FIREBASE_SERVICE_ACCOUNT) {
+  serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
+} else {
+  try {
+    serviceAccount = await import('./serviceAccountKey.json', { with: { type: 'json' } }).then(m => m.default);
+  } catch {
+    console.error('❌ CRITICAL: Firebase credentials not found.');
+    console.error('   Set FIREBASE_SERVICE_ACCOUNT env var or place serviceAccountKey.json in the project root.');
+    process.exit(1);
+  }
+}
 
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount)
