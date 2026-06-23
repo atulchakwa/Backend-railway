@@ -23,18 +23,9 @@ import { ExcelGenerator } from './excel_generator.js';
 import { ReportService } from './report_service.js';
 
 const TWO_FACTOR_API_KEY = process.env.TWOF_API_KEY;
-let serviceAccount;
-if (process.env.FIREBASE_SERVICE_ACCOUNT) {
-  serviceAccount = JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT);
-} else {
-  try {
-    serviceAccount = await import('./serviceAccountKey.json', { with: { type: 'json' } }).then(m => m.default);
-  } catch {
-    console.error('❌ CRITICAL: Firebase credentials not found.');
-    console.error('   Set FIREBASE_SERVICE_ACCOUNT env var or place serviceAccountKey.json in the project root.');
-    process.exit(1);
-  }
-}
+const serviceAccount = process.env.FIREBASE_SERVICE_ACCOUNT
+  ? JSON.parse(process.env.FIREBASE_SERVICE_ACCOUNT)
+  : await import('./serviceAccountKey.json', { with: { type: 'json' } }).then(m => m.default);
 
 admin.initializeApp({
   credential: admin.credential.cert(serviceAccount)
@@ -843,6 +834,7 @@ app.get('/api/passenger/train/:trainNo/coaches', async (req, res) => {
 
     const sortedCoaches = Array.from(coachSet).sort();
     return res.status(200).json({ success: true, coaches: sortedCoaches });
+
   } catch (error) {
     console.error('(Passenger Coaches Fetch) Failed:', error);
     return res.status(500).json({ error: 'Internal Server Error', details: error.message });
@@ -3525,7 +3517,7 @@ async function generateTaskInstancesForRun(runData) {
 
   for (const coach of runData.coaches) {
     const isAC = /^[ABHME]/i.test(coach.coachPosition || '') ||
-                 (coach.coachType && coach.coachType.toUpperCase().includes('AC'));
+      (coach.coachType && coach.coachType.toUpperCase().includes('AC'));
 
     if (!isAC || !coach.attendantId) continue;
 
@@ -3860,7 +3852,7 @@ app.put('/api/run-instances/:runInstanceId', verifyToken, async (req, res) => {
       });
 
       const workerIdList = Array.from(uniqueWorkerIds).filter(id => id && typeof id === 'string');
-      
+
       if (workerIdList.length > 0) {
         // Fetch in batches of 30 (Firestore limit for 'in' queries)
         const batches = [];
@@ -3872,7 +3864,7 @@ app.put('/api/run-instances/:runInstanceId', verifyToken, async (req, res) => {
           const workersSnap = await db.collection('users')
             .where(admin.firestore.FieldPath.documentId(), 'in', batch)
             .get();
-          
+
           workersSnap.forEach(doc => {
             const data = doc.data();
             workerNamesCache.set(doc.id, data.fullName || data.name || "Unknown Worker");
@@ -3971,7 +3963,7 @@ app.put('/api/run-instances/:runInstanceId', verifyToken, async (req, res) => {
     await runInstanceRef.update(updateData);
 
     const updatedDoc = await runInstanceRef.get();
-    
+
     res.status(200).send({
       message: 'Run Instance updated successfully',
       runInstanceId: runInstanceId,
@@ -9185,65 +9177,41 @@ async function verifyFaceLiveness(imageUrl, expectedChallenge) {
       const command = new DetectLabelsCommand({
         Image: { Bytes: fileBuffer },
         MaxLabels: 20,
+        MinConfidence: 60
       });
-
       const data = await rekognition.send(command);
-      const labels = data.Labels || [];
-      
-      let matched = false;
-      const detectedLabels = labels.map(l => l.Name.toLowerCase());
-      console.log(`[Liveness Debug] Detected labels:`, detectedLabels);
+      const labels = data.Labels.map(l => l.Name.toUpperCase());
 
-      if (expectedChallenge === 'THUMBS_UP') {
-        matched = labels.some(l => {
-          const name = l.Name.toLowerCase();
-          return (name.includes('thumb') || name.includes('hand') || name.includes('finger') || name.includes('gesture')) && l.Confidence > 60;
-        });
-      } else if (expectedChallenge === 'FIST') {
-        matched = labels.some(l => {
-          const name = l.Name.toLowerCase();
-          return (name.includes('fist') || name.includes('hand') || name.includes('clenched')) && l.Confidence > 60;
-        });
-      }
+      let isMatch = false;
+      if (expectedChallenge === 'THUMBS_UP' && labels.includes('THUMBS UP')) isMatch = true;
+      if (expectedChallenge === 'FIST' && (labels.includes('FIST') || labels.includes('HAND') || labels.includes('FINGERS'))) isMatch = true;
 
-      if (matched) {
-        return { matched: true, reason: `Successfully verified gesture challenge: ${expectedChallenge}` };
-      } else {
-        return { matched: false, reason: `Failed to detect the expected gesture: ${expectedChallenge}` };
+      if (!isMatch) {
+        return { matched: false, reason: `Could not detect ${expectedChallenge} gesture in the photo.` };
       }
-    } else {
+      return { matched: true };
+    }
+
+    if (expectedChallenge === 'SMILE') {
       const command = new DetectFacesCommand({
         Image: { Bytes: fileBuffer },
-        Attributes: ['ALL']
+        Attributes: ["ALL"]
       });
-
       const data = await rekognition.send(command);
       if (!data.FaceDetails || data.FaceDetails.length === 0) {
-        return { matched: false, reason: "No face detected in the image." };
+        return { matched: false, reason: "No face detected in the photo." };
       }
-
       const face = data.FaceDetails[0];
-      let matched = false;
-
-      if (expectedChallenge === 'SMILE') {
-        matched = face.Smile && face.Smile.Value === true && face.Smile.Confidence > 70;
-      } else if (expectedChallenge === 'EYES_OPEN') {
-        matched = face.EyesOpen && face.EyesOpen.Value === true && face.EyesOpen.Confidence > 70;
-      } else if (expectedChallenge === 'BLINK' || expectedChallenge === 'EYES_CLOSED') {
-        matched = face.EyesOpen && face.EyesOpen.Value === false && face.EyesOpen.Confidence > 70;
-      } else {
-        matched = true;
+      if (face.Smile && face.Smile.Value === true && face.Smile.Confidence > 60) {
+        return { matched: true };
       }
-
-      if (matched) {
-        return { matched: true, reason: `Successfully verified face challenge: ${expectedChallenge}` };
-      } else {
-        return { matched: false, reason: `Failed to verify expected face challenge: ${expectedChallenge}` };
-      }
+      return { matched: false, reason: "Could not detect a clear SMILE in the photo." };
     }
+
+    return { matched: true }; // Default pass if unknown challenge
   } catch (err) {
-    console.error("AWS Rekognition liveness failure:", err.message);
-    return { matched: false, reason: "Internal system error during liveness verification." };
+    console.error("verifyFaceLiveness error:", err.message);
+    return { matched: false, reason: "Liveness verification failed due to internal error." };
   }
 }
 
@@ -9381,7 +9349,8 @@ app.post('/api/obhs/attendance', verifyToken, async (req, res) => {
       'longitude',
       'deviceTimestamp',
       'mobileNumber',
-      'deviceId'
+      'deviceId',
+      'livenessChallenge'
     ];
 
     const bodyKeys = Object.keys(req.body);
@@ -9394,7 +9363,7 @@ app.post('/api/obhs/attendance', verifyToken, async (req, res) => {
       }
     }
 
-    const { runInstanceId, attendanceType, imageUrl, latitude, longitude, deviceTimestamp, mobileNumber, deviceId } = req.body;
+    const { runInstanceId, attendanceType, imageUrl, latitude, longitude, deviceTimestamp, mobileNumber, deviceId, livenessChallenge } = req.body;
 
     if (!runInstanceId || !attendanceType || !imageUrl || !deviceTimestamp) {
       return res.status(400).send({
@@ -9409,6 +9378,16 @@ app.post('/api/obhs/attendance', verifyToken, async (req, res) => {
         error: "Invalid attendanceType.",
         details: "Allowed values are: 'start', 'mid', 'end'"
       });
+    }
+
+    if (livenessChallenge) {
+      const livenessResult = await verifyFaceLiveness(imageUrl, livenessChallenge);
+      if (!livenessResult.matched) {
+        return res.status(400).send({
+          error: "Liveness Verification Failed",
+          details: livenessResult.reason
+        });
+      }
     }
 
     const { uid: workerId, fullName: workerName } = req.user;
@@ -9800,57 +9779,6 @@ app.post('/api/compareFace', verifyToken, async (req, res) => {
     });
   } catch (error) {
     res.status(500).send({ error: 'Face comparison failed', details: error.message });
-  }
-});
-
-app.post('/api/verifyLiveness', verifyToken, async (req, res) => {
-  try {
-    const { imageUrl, expectedChallenge } = req.body;
-    if (!imageUrl || !expectedChallenge) {
-      return res.status(400).send({
-        error: "Missing parameters",
-        details: "Both imageUrl and expectedChallenge are required."
-      });
-    }
-    const result = await verifyFaceLiveness(imageUrl, expectedChallenge);
-    res.status(result.matched ? 200 : 400).send(result);
-  } catch (error) {
-    console.error('(Liveness Verification Endpoint) Error:', error);
-    res.status(500).send({ error: 'Liveness verification failed', details: error.message });
-  }
-});
-
-app.post('/api/verifyFaceLiveness', verifyToken, async (req, res) => {
-  try {
-    const { imageUrl, expectedChallenge } = req.body;
-    if (!imageUrl || !expectedChallenge) {
-      return res.status(400).send({
-        error: "Missing parameters",
-        details: "Both imageUrl and expectedChallenge are required."
-      });
-    }
-    const result = await verifyFaceLiveness(imageUrl, expectedChallenge);
-    res.status(result.matched ? 200 : 400).send(result);
-  } catch (error) {
-    console.error('(Face Liveness Verification Endpoint) Error:', error);
-    res.status(500).send({ error: 'Face liveness verification failed', details: error.message });
-  }
-});
-
-app.post('/api/obhs/attendance/verify-liveness', verifyToken, async (req, res) => {
-  try {
-    const { imageUrl, expectedChallenge } = req.body;
-    if (!imageUrl || !expectedChallenge) {
-      return res.status(400).send({
-        error: "Missing parameters",
-        details: "Both imageUrl and expectedChallenge are required."
-      });
-    }
-    const result = await verifyFaceLiveness(imageUrl, expectedChallenge);
-    res.status(result.matched ? 200 : 400).send(result);
-  } catch (error) {
-    console.error('(Attendance Liveness Verification Endpoint) Error:', error);
-    res.status(500).send({ error: 'Liveness verification failed', details: error.message });
   }
 });
 
@@ -14231,11 +14159,11 @@ app.post('/api/reports/generate/audit', verifyToken, async (req, res) => {
       pdfBuffer = await pdfRenderer.generateAttendanceAudit(data);
     } else if (reportType === 'WORKER_ACTIVITY') {
       // For now, mapping to Attendance data to match the pattern (Needs separate activity logic)
-      data = await reportService.getAttendanceAuditData(runInstanceId, workerId); 
+      data = await reportService.getAttendanceAuditData(runInstanceId, workerId);
       pdfBuffer = await pdfRenderer.generateWorkerActivityAudit(data);
     } else if (reportType === 'COMPLAINT_AUDIT') {
       // For now, mapping to Attendance data to match the pattern (Needs separate complaint logic)
-      data = await reportService.getAttendanceAuditData(runInstanceId, workerId); 
+      data = await reportService.getAttendanceAuditData(runInstanceId, workerId);
       pdfBuffer = await pdfRenderer.generateComplaintAudit(data);
     } else if (reportType === 'OPERATIONAL_AUDIT') {
       data = await reportService.getOperationalAuditData(runInstanceId);
@@ -14266,7 +14194,7 @@ app.post('/api/reports/generate/audit', verifyToken, async (req, res) => {
 app.post('/api/reports/send-email', verifyToken, async (req, res) => {
   try {
     const { reportType, runInstanceId, workerId, emailTo = 'hirenkodwani@gmail.com' } = req.body;
-    
+
     if (!reportType || !runInstanceId) {
       return res.status(400).json({ error: 'reportType and runInstanceId are required' });
     }
@@ -17210,4 +17138,3 @@ seedTaskMasters();
 app.listen(port, () => {
   console.log(`Server is running on http://localhost:${port}`);
 });
-
